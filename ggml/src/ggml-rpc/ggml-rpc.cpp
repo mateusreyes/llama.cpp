@@ -304,17 +304,44 @@ static bool parse_endpoint(const std::string & endpoint, std::string & host, int
     return true;
 }
 
+// Owning cache of client sockets keyed by endpoint. Evicted on transport failure
+// so the next get_socket() reconnects after a server restart.
+static std::mutex rpc_sockets_mutex;
+static std::unordered_map<std::string, std::shared_ptr<socket_t>> rpc_sockets;
+
+static void evict_socket(const std::string & endpoint) {
+    std::lock_guard<std::mutex> lock(rpc_sockets_mutex);
+    rpc_sockets.erase(endpoint);
+}
+
+static void evict_socket_by_ptr(const socket_t * sock) {
+    if (sock == nullptr) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(rpc_sockets_mutex);
+    for (auto it = rpc_sockets.begin(); it != rpc_sockets.end(); ) {
+        if (it->second.get() == sock) {
+            it = rpc_sockets.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
 // RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
 // No response
 static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size) {
     uint8_t cmd_byte = cmd;
     if (!sock->send_data(&cmd_byte, sizeof(cmd_byte))) {
+        evict_socket_by_ptr(sock.get());
         return false;
     }
     if (!sock->send_data(&input_size, sizeof(input_size))) {
+        evict_socket_by_ptr(sock.get());
         return false;
     }
     if (!sock->send_data(input, input_size)) {
+        evict_socket_by_ptr(sock.get());
         return false;
     }
     return true;
@@ -328,12 +355,14 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, 
     }
     uint64_t out_size;
     if (!sock->recv_data(&out_size, sizeof(out_size))) {
+        evict_socket_by_ptr(sock.get());
         return false;
     }
     if (out_size != output_size) {
         return false;
     }
     if (!sock->recv_data(output, output_size)) {
+        evict_socket_by_ptr(sock.get());
         return false;
     }
     return true;
@@ -364,14 +393,11 @@ static bool negotiate_hello(const std::shared_ptr<socket_t> & sock) {
 }
 
 static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
-    static std::mutex mutex;
-    std::lock_guard<std::mutex> lock(mutex);
-    static std::unordered_map<std::string, std::weak_ptr<socket_t>> sockets;
-
-    auto it = sockets.find(endpoint);
-    if (it != sockets.end()) {
-        if (auto sock = it->second.lock()) {
-            return sock;
+    {
+        std::lock_guard<std::mutex> lock(rpc_sockets_mutex);
+        auto it = rpc_sockets.find(endpoint);
+        if (it != rpc_sockets.end()) {
+            return it->second;
         }
     }
     std::string host;
@@ -380,7 +406,6 @@ static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
         GGML_LOG_ERROR("Failed to parse endpoint: %s\n", endpoint.c_str());
         return nullptr;
     }
-
     if (!rpc_transport_init()) {
         return nullptr;
     }
@@ -388,12 +413,17 @@ static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
     if (sock == nullptr) {
         return nullptr;
     }
+    // negotiate_hello issues send_rpc_cmd, which may try to evict on failure; do
+    // not hold rpc_sockets_mutex across it.
     if (!negotiate_hello(sock)) {
         return nullptr;
     }
-    LOG_DBG("[%s] connected to %s\n", __func__, endpoint.c_str());
-    sockets[endpoint] = sock;
-    return sock;
+    std::lock_guard<std::mutex> lock(rpc_sockets_mutex);
+    auto [it, inserted] = rpc_sockets.emplace(endpoint, sock);
+    if (inserted) {
+        LOG_DBG("[%s] connected to %s\n", __func__, endpoint.c_str());
+    }
+    return it->second;
 }
 
 static void ggml_backend_rpc_buffer_free_buffer(ggml_backend_buffer_t buffer) {
