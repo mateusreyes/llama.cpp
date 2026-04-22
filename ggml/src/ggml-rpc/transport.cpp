@@ -192,18 +192,35 @@ std::optional<rdma_gid_t> socket_t::impl::rdma_build_target_gid() {
 }
 
 bool socket_t::impl::rdma_probe() {
-    const char * dev_env = std::getenv("GGML_RDMA_DEV");
-    const char * gid_env = std::getenv("GGML_RDMA_GID");
+    const char * dev_env    = std::getenv("GGML_RDMA_DEV");
+    const char * gid_env    = std::getenv("GGML_RDMA_GID");
+    const char * inline_env = std::getenv("GGML_RDMA_MAX_INLINE");
+
+    uint32_t requested_inline = 256;
+    if (inline_env) {
+        char * end = nullptr;
+        unsigned long v = strtoul(inline_env, &end, 10);
+        if (end != inline_env && v <= UINT32_MAX) {
+            requested_inline = (uint32_t)v;
+        } else {
+            GGML_LOG_INFO("RDMA probe: ignoring invalid GGML_RDMA_MAX_INLINE='%s'\n", inline_env);
+        }
+    }
 
     auto target_gid = rdma_build_target_gid();
     if (!target_gid) {
+        GGML_LOG_INFO("RDMA probe failed: cannot derive local GID from socket: %s\n", strerror(errno));
         return false;
     }
 
     const uint8_t ib_port = 1;
     int num_devs = 0;
     ibv_device ** devs = ibv_get_device_list(&num_devs);
-    if (!devs || num_devs == 0) return false;
+    if (!devs || num_devs == 0) {
+        GGML_LOG_INFO("RDMA probe failed: ibv_get_device_list returned no devices\n");
+        if (devs) ibv_free_device_list(devs);
+        return false;
+    }
 
     ibv_context * ibctx = nullptr;
     const char * matched_dev = nullptr;
@@ -264,7 +281,10 @@ bool socket_t::impl::rdma_probe() {
         ibv_close_device(ctx);
     }
     ibv_free_device_list(devs);
-    if (!ibctx) return false;
+    if (!ibctx) {
+        GGML_LOG_INFO("RDMA probe failed: no device with a GID matching the local socket address\n");
+        return false;
+    }
 
     rdma_local.ib_port = ib_port;
     rdma_local.gid_idx = gid_idx;
@@ -273,11 +293,18 @@ bool socket_t::impl::rdma_probe() {
     rdma->ctx = ibctx;
 
     rdma->pd = ibv_alloc_pd(ibctx);
-    if (!rdma->pd) return false;
+    if (!rdma->pd) {
+        GGML_LOG_INFO("RDMA probe failed: ibv_alloc_pd: %s\n", strerror(errno));
+        return false;
+    }
 
     rdma->scq = ibv_create_cq(ibctx, 16, nullptr, nullptr, 0);
     rdma->rcq = ibv_create_cq(ibctx, RDMA_RX_DEPTH + 4, nullptr, nullptr, 0);
-    if (!rdma->scq || !rdma->rcq) return false;
+    if (!rdma->scq || !rdma->rcq) {
+        GGML_LOG_INFO("RDMA probe failed: ibv_create_cq (scq=%p rcq=%p): %s\n",
+                      (void *)rdma->scq, (void *)rdma->rcq, strerror(errno));
+        return false;
+    }
 
     ibv_qp_init_attr qia = {};
     qia.send_cq = rdma->scq;
@@ -287,23 +314,48 @@ bool socket_t::impl::rdma_probe() {
     qia.cap.max_recv_wr     = RDMA_RX_DEPTH + 4;
     qia.cap.max_send_sge    = 1;
     qia.cap.max_recv_sge    = 1;
-    qia.cap.max_inline_data = 256;
+    qia.cap.max_inline_data = requested_inline;
 
+    // ibverbs has no public verb to query the device's max inline cap upfront.
+    // Some drivers (e.g. irdma on Intel E810) reject ibv_create_qp instead of
+    // clamping silently, so retry once with a conservative cap on failure.
     rdma->qp = ibv_create_qp(rdma->pd, &qia);
-    if (!rdma->qp) return false;
+    if (!rdma->qp && requested_inline > 48) {
+        GGML_LOG_INFO("RDMA probe: ibv_create_qp with max_inline_data=%u failed (%s), retrying with 48\n",
+                      requested_inline, strerror(errno));
+        qia.cap.max_inline_data = 48;
+        rdma->qp = ibv_create_qp(rdma->pd, &qia);
+    }
+    if (!rdma->qp) {
+        GGML_LOG_INFO("RDMA probe failed: ibv_create_qp (max_inline_data=%u): %s\n",
+                      qia.cap.max_inline_data, strerror(errno));
+        return false;
+    }
     rdma->max_inline = qia.cap.max_inline_data;
 
     rdma->tx_buf = aligned_alloc(4096, RDMA_CHUNK);
     rdma->rx_buf = aligned_alloc(4096, static_cast<size_t>(RDMA_RX_DEPTH) * RDMA_CHUNK);
-    if (!rdma->tx_buf || !rdma->rx_buf) return false;
+    if (!rdma->tx_buf || !rdma->rx_buf) {
+        GGML_LOG_INFO("RDMA probe failed: aligned_alloc for tx/rx buffers (tx=%p rx=%p)\n",
+                      rdma->tx_buf, rdma->rx_buf);
+        return false;
+    }
 
     rdma->tx_mr = ibv_reg_mr(rdma->pd, rdma->tx_buf, RDMA_CHUNK, IBV_ACCESS_LOCAL_WRITE);
     rdma->rx_mr = ibv_reg_mr(rdma->pd, rdma->rx_buf, static_cast<size_t>(RDMA_RX_DEPTH) * RDMA_CHUNK,
                            IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
-    if (!rdma->tx_mr || !rdma->rx_mr) return false;
+    if (!rdma->tx_mr || !rdma->rx_mr) {
+        GGML_LOG_INFO("RDMA probe failed: ibv_reg_mr (tx_mr=%p rx_mr=%p): %s\n",
+                      (void *)rdma->tx_mr, (void *)rdma->rx_mr, strerror(errno));
+        return false;
+    }
 
     ibv_gid local_gid;
-    if (ibv_query_gid(ibctx, ib_port, gid_idx, &local_gid) != 0) return false;
+    if (ibv_query_gid(ibctx, ib_port, gid_idx, &local_gid) != 0) {
+        GGML_LOG_INFO("RDMA probe failed: ibv_query_gid(port=%u, idx=%d): %s\n",
+                      ib_port, gid_idx, strerror(errno));
+        return false;
+    }
 
     rdma_local.qpn = rdma->qp->qp_num;
     rdma_local.psn = rdma->qp->qp_num & 0xffffff;
@@ -330,14 +382,19 @@ bool socket_t::impl::rdma_activate(uint32_t remote_qpn, uint32_t remote_psn, con
         a.port_num        = rdma_local.ib_port;
         a.pkey_index      = 0;
         a.qp_access_flags = IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_LOCAL_WRITE;
-        if (ibv_modify_qp(rdma->qp, &a,
-                IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS) != 0) {
+        int rc = ibv_modify_qp(rdma->qp, &a,
+                IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS);
+        if (rc != 0) {
+            GGML_LOG_INFO("RDMA activate failed: ibv_modify_qp RESET->INIT: %s\n", strerror(rc));
             return false;
         }
     }
 
     for (int i = 0; i < RDMA_RX_DEPTH; i++) {
-        if (!rdma->post_rx(i)) return false;
+        if (!rdma->post_rx(i)) {
+            GGML_LOG_INFO("RDMA activate failed: ibv_post_recv slot %d failed\n", i);
+            return false;
+        }
     }
 
     // INIT -> RTR
@@ -355,9 +412,11 @@ bool socket_t::impl::rdma_activate(uint32_t remote_qpn, uint32_t remote_psn, con
         a.ah_attr.grh.sgid_index = rdma_local.gid_idx;
         a.ah_attr.dlid       = 0;
         a.ah_attr.port_num   = rdma_local.ib_port;
-        if (ibv_modify_qp(rdma->qp, &a,
+        int rc = ibv_modify_qp(rdma->qp, &a,
                 IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
-                IBV_QP_RQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER) != 0) {
+                IBV_QP_RQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER);
+        if (rc != 0) {
+            GGML_LOG_INFO("RDMA activate failed: ibv_modify_qp INIT->RTR: %s\n", strerror(rc));
             return false;
         }
     }
@@ -371,9 +430,11 @@ bool socket_t::impl::rdma_activate(uint32_t remote_qpn, uint32_t remote_psn, con
         a.rnr_retry    = 7;
         a.sq_psn       = rdma_local.psn;
         a.max_rd_atomic = 1;
-        if (ibv_modify_qp(rdma->qp, &a,
+        int rc = ibv_modify_qp(rdma->qp, &a,
                 IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY |
-                IBV_QP_SQ_PSN | IBV_QP_MAX_QP_RD_ATOMIC) != 0) {
+                IBV_QP_SQ_PSN | IBV_QP_MAX_QP_RD_ATOMIC);
+        if (rc != 0) {
+            GGML_LOG_INFO("RDMA activate failed: ibv_modify_qp RTR->RTS: %s\n", strerror(rc));
             return false;
         }
     }

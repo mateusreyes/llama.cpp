@@ -101,6 +101,8 @@ On Linux systems with RoCEv2-capable NICs (e.g. Mellanox ConnectX), the RPC back
 
 RDMA is enabled by default when `libibverbs` is found at build time.
 
+The upper bound on the QP `max_inline_data` requested during the probe can be controlled via the `GGML_RDMA_MAX_INLINE` environment variable (default 256). If the driver rejects this value, the probe automatically retries with a smaller value of 48, which works around drivers such as Intel `irdma` that cap inline payloads more aggressively.
+
 ### Troubleshooting
 
 Use the `GGML_RPC_DEBUG` environment variable to enable debug messages from `rpc-server`:
